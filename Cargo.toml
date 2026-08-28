@@ -1,0 +1,10 @@
+[package]
+name = "bevy_dynamic_sky"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy.workspace = true
+
+[dev-dependencies]
+bevy = { workspace = true, features = ["jpeg", "png"] }
