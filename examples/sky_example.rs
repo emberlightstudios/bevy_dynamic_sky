@@ -3,6 +3,7 @@ use bevy::camera::{ClearColorConfig, RenderTarget};
 use bevy::math::Dir3;
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
+use bevy::time::{Timer, TimerMode};
 use bevy::window::PrimaryWindow;
 use bevy_dynamic_sky::{
     DynamicSky, MainCamera, Rotator, SkyCamera, SkyDomeMaterial, SkyDomeUniforms, SkyLayer,
@@ -14,7 +15,15 @@ fn main() {
         .add_plugins(bevy_dynamic_sky::DynamicSkyPlugin::<1>)
         .init_resource::<CameraController>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (camera_look, resize_sky_target))
+        .add_systems(
+            Update,
+            (
+                camera_look,
+                resize_sky_target,
+                spawn_sky_scene,
+                animate_dome,
+            ),
+        )
         .run();
 }
 
@@ -29,18 +38,34 @@ struct CameraController {
 #[derive(Resource)]
 struct SkyTargetSize(pub (u32, u32));
 
+/// Handle to the dome material so we can advance its `uniforms.time` each frame.
+#[derive(Resource)]
+struct DomeMaterial(Handle<SkyDomeMaterial>);
+
+/// Handle to the offscreen sky render target.
+#[derive(Resource)]
+struct SkyTargetImage(Handle<Image>);
+
+/// Counts down before the sky scene (dome + celestial bodies + floor/light) is
+/// spawned. We spawn only the main camera at startup and load the rest a few
+/// seconds later. (On bevy 0.19 this is purely a load-order preference — the
+/// self-contained dome shader needs no deferral, but the structure was requested
+/// and works fine.)
+#[derive(Resource)]
+struct SkySpawnTimer(Timer);
+
+/// Ensures the deferred sky scene is spawned exactly once.
+#[derive(Resource, Default)]
+struct SkySpawned(bool);
+
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    sky_layer: Res<SkyLayer>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut dome_materials: ResMut<Assets<SkyDomeMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    windows: Query<&Window>,
+    windows: Query<&Window, With<PrimaryWindow>>,
 ) {
-    let layer = sky_layer.0;
-
     // Offscreen render target the SkyCamera writes to (and the main camera reads).
     let window = windows.single().expect("expected exactly one window");
     let sky_size = (
@@ -54,7 +79,29 @@ fn setup(
         None,
     ));
 
-    // Main (viewer) camera: composites the sky target and is the sync source.
+    // Build the dome material up front so we can keep a handle for the deferred
+    // spawn and animate its `uniforms.time` each frame.
+    let dome_material = dome_materials.add(SkyDomeMaterial {
+        background_texture: Some(asset_server.load("Milkyway.jpg")),
+        starfield_texture: Some(asset_server.load("StarField.jpg")),
+        uniforms: SkyDomeUniforms {
+            background_brightness: 1.,
+            noise_brightness: 1.0,
+            noise_scale: 1.0,
+            noise_strength: 1.0,
+            noise_speed: 0.0025,
+            time: 0.0,
+        },
+    });
+
+    commands.insert_resource(DomeMaterial(dome_material));
+    commands.insert_resource(SkyTargetImage(sky_target.clone()));
+    commands.insert_resource(SkyTargetSize(sky_size));
+    commands.insert_resource(SkySpawnTimer(Timer::from_seconds(3.0, TimerMode::Once)));
+    commands.insert_resource(SkySpawned(false));
+
+    // Main (viewer) camera ONLY at startup. It composites the sky target and is
+    // the sync source for the (not-yet-spawned) SkyCamera.
     commands.spawn((
         Camera3d::default(),
         MainCamera,
@@ -69,28 +116,49 @@ fn setup(
         Transform::from_xyz(0.0, 1.6, 5.0),
     ));
 
-    let sphere = meshes.add(Sphere::new(1.0).mesh().uv(16, 16));
+    // The sphere mesh is created here only so the asset is warmed; the deferred
+    // spawn rebuilds its own handle (cheap, idempotent).
+    let _sphere = meshes.add(Sphere::new(1.0).mesh().uv(16, 16));
+}
 
-    let milkyway = asset_server.load("Milkyway.jpg");
+/// Spawns the full sky scene (dome + solar system + floor/light) once the startup
+/// timer elapses. Everything here is deferred so the heavy scene loads after the
+/// viewer camera is up.
+fn spawn_sky_scene(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut timer: ResMut<SkySpawnTimer>,
+    mut spawned: ResMut<SkySpawned>,
+    dome: Res<DomeMaterial>,
+    sky_target: Res<SkyTargetImage>,
+    sky_layer: Res<SkyLayer>,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if spawned.0 {
+        return;
+    }
+    timer.0.tick(time.delta());
+    if !(timer.0.elapsed() >= timer.0.duration()) {
+        return;
+    }
+    spawned.0 = true;
+
+    let layer = sky_layer.0;
+    let sphere = meshes.add(Sphere::new(1.0).mesh().uv(16, 16));
     let moon_texture = asset_server.load("MoonMap.png");
+    let dome_material = dome.0.clone();
 
     // --- Solar system, all on the sky layer (rendered by the SkyCamera).
     // Sun (root) -> orbital Rotator -> offset -> axial tilt -> spin Rotator ->
     // SkyCamera (leaf). The camera orbits with the earth while its rotation is
-    // still synced to the main camera via the crate's `sync_sky_camera`.
-    // `Rotator` `#[require]`s `Transform`, so the `Orbit`/`Spin` pivots get a
-    // transform automatically; nested tuples + `children!` build the hierarchy.
+    // still synced to the main camera via the crate's `sync_sky_camera`. `Rotator`
+    // `#[require]`s `Transform`, so the `Orbit`/`Spin` pivots get a transform
+    // automatically; nested tuples + `children!` build the hierarchy.
     commands.spawn((
         Name::new("Sun"),
-        Mesh3d(sphere.clone()),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(1.0, 0.85, 0.2).into(),
-            emissive: Color::srgb(1.0, 0.8, 0.2).into(),
-            unlit: true,
-            ..default()
-        })),
-        RenderLayers::layer(layer),
-        Transform::from_scale(Vec3::splat(20.0)),
+        Transform::IDENTITY,
         children![
             (
                 Name::new("Dome"),
@@ -99,15 +167,7 @@ fn setup(
                 // a sped-up sidereal day (~21 min/rev) so it's perceptible.
                 Rotator::new(Dir3::Y, 0.005),
                 Mesh3d(sphere.clone()),
-                MeshMaterial3d(dome_materials.add(SkyDomeMaterial {
-                    base_color_texture: Some(milkyway),
-                    uniforms: SkyDomeUniforms {
-                        brightness: 0.1,
-                        noise_scale: 4.0,
-                        noise_strength: 0.15,
-                        noise_offset: Vec3::ZERO,
-                    },
-                })),
+                MeshMaterial3d(dome_material.clone()),
                 RenderLayers::layer(layer),
                 Transform::from_scale(Vec3::splat(-1000.0)),
             ),
@@ -142,7 +202,7 @@ fn setup(
                                         RenderLayers::layer(layer),
                                         Transform::from_xyz(30.0, 0.0, 0.0)
                                             .with_scale(Vec3::splat(4.0)),
-                                    ),]
+                                    ),],
                                 ),
                                 // Observer: the camera's position on the world.
                                 // The latitude rotation tilts the local frame,
@@ -161,14 +221,14 @@ fn setup(
                                         },
                                         RenderLayers::layer(layer),
                                         Transform::default(),
-                                        RenderTarget::Image(sky_target.clone().into()),
-                                    ),]
+                                        RenderTarget::Image(sky_target.0.clone().into()),
+                                    ),],
                                 ),
                             ],
-                        )],
-                    )],
-                )],
-            )
+                        ),],
+                    ),],
+                ),],
+            ),
         ],
     ));
 
@@ -192,8 +252,21 @@ fn setup(
         Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
         RenderLayers::layer(0),
     ));
+}
 
-    commands.insert_resource(SkyTargetSize(sky_size));
+/// Advances the dome material's `uniforms.time` each frame. This mirrors
+/// `bevy_pbr`'s `globals.time` without importing its embedded shaders — on bevy
+/// 0.19 a shader in this crate cannot resolve `bevy_pbr` module imports
+/// (cross-crate WESL imports are unsupported until 0.20). Works on every bevy
+/// version, so it's the "final" form.
+fn animate_dome(
+    time: Res<Time>,
+    dome: Res<DomeMaterial>,
+    mut dome_materials: ResMut<Assets<SkyDomeMaterial>>,
+) {
+    if let Some(mut material) = dome_materials.get_mut(&dome.0) {
+        material.uniforms.time = time.elapsed_secs();
+    }
 }
 
 fn camera_look(

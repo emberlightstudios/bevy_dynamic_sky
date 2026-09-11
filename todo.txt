@@ -1,0 +1,3 @@
+Apparently wesl imports don't work cross-crate in 0.19.  Have to wait for 0.20, at least according to AI.
+
+Or we could make every shader self contained, pass our own time uniform etc.

@@ -46,7 +46,6 @@ impl<const SKY_LAYER: usize> Default for DynamicSkyPlugin<SKY_LAYER> {
 impl<const SKY_LAYER: usize> Plugin for DynamicSkyPlugin<SKY_LAYER> {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "sky_composite.wgsl");
-        embedded_asset!(app, "sky_dome.wgsl");
 
         app.add_plugins(bevy::pbr::MaterialPlugin::<SkyDomeMaterial>::default());
 
