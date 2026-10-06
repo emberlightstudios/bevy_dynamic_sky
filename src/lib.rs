@@ -1,4 +1,4 @@
-use bevy::asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
+use bevy::asset::{AssetServer, Handle, embedded_asset, load_embedded_asset};
 use bevy::camera::{MainPassResolutionOverride, Viewport};
 use bevy::core_pipeline::core_3d::main_opaque_pass_3d;
 use bevy::core_pipeline::schedule::Core3d;
